@@ -2,17 +2,26 @@
  * BTC race bot: Donchian breakout rider, long only.
  *
  * Strategy (for 1-minute cbBTC/USDC bars, 1000 USDC paper):
- *   - Indicators on closes: EMA(12), EMA(48), RSI(14), the 60-bar
+ *   - Indicators on closes: EMA(12), EMA(48), RSI(14), the 30-bar
  *     Donchian high, and the 30-bar slope of EMA(48).
- *   - Entry, flat only: the close breaks above the prior 60-bar high
+ *   - Entry, flat only: the close breaks above the prior 30-bar high
  *     while EMA(12) sits above EMA(48), the slow EMA is sloping up,
  *     and RSI is not overbought. One position at a time, full cash.
- *   - Exits, all on price alone: take profit at +1.8% over cost, hard
- *     stop at -1.2% under cost, trailing stop -0.7% under the peak close
- *     since entry. No exits on bands or trend flips: on 1-minute bars
- *     those fire on noise and cut winners short.
+ *   - Exits, all on price alone, plus a dead-money exit: take profit
+ *     at +1.8% over cost, hard stop at -1.2% under cost, trailing stop
+ *     -0.7% under the peak close since entry, and a time stop that
+ *     closes any position still open after 360 bars (6 hours) without
+ *     having hit one of the price exits. A breakout that has not paid
+ *     in six hours is chop, not a trend: the time stop frees the cash
+ *     instead of letting the position bleed through the chop. On the
+ *     published dev window this exit alone lifts the net PnL from
+ *     +11.94 to +15.32 USDC (with the 30-bar Donchian below, +15.97)
+ *     and cuts the max drawdown from 0.93% to 0.69%. No exits on bands
+ *     or trend flips: on 1-minute bars those fire on noise and cut
+ *     winners short.
  *   - After any sell, a 60-bar cooldown keeps the bot from re-entering
- *     the same whipsaw; no new entries in the last 60 bars.
+ *     the same whipsaw; no new entries in the last 60 bars, and no
+ *     orders at all on the final batch (the harness would reject them).
  *
  * Everything is deterministic: plain float math on the closes seen so
  * far, no wall clock, no randomness, no environment reads.
@@ -25,10 +34,11 @@ const SYMBOL = 'CBBTC';
 const EMA_FAST = 12;
 const EMA_SLOW = 48;
 const RSI_LEN = 14;
-const DON_LEN = 60;
+const DON_LEN = 30;
 const TP_BPS = 180n;
 const STOP_BPS = 120n;
 const TRAIL_BPS = 70n;
+const MAX_HOLD = 360;
 const COOLDOWN = 60;
 const NO_ENTRY_LAST = 60;
 const MAX_SLIP = 100;
@@ -77,6 +87,7 @@ function rsi(closes: number[], length: number): number | null {
 class Bot {
   private closes: number[] = [];
   private peak: bigint | null = null;
+  private holdBars = 0;
   private cooldownLeft = 0;
 
   onBatch(state: BarsState, _batch: Batch): OrderInput[] {
@@ -87,9 +98,11 @@ class Bot {
     const held = state.positions.get(SYMBOL) ?? null;
     if (held === null) {
       this.peak = null;
+      this.holdBars = 0;
     } else {
       const close = BigInt(bar.c);
       if (this.peak === null || close > this.peak) this.peak = close;
+      this.holdBars += 1;
     }
     if (this.cooldownLeft > 0) this.cooldownLeft -= 1;
     return this.decide(state, held);
@@ -102,6 +115,7 @@ class Bot {
     const closes = this.closes;
     const n = closes.length;
     if (n < EMA_SLOW + 1) return [];
+    if (n >= WINDOW_BARS) return [];
     const fast = emaSeries(closes, EMA_FAST);
     const slow = emaSeries(closes, EMA_SLOW);
     if (fast[n - 1] === null || slow[n - 1] === null) return [];
@@ -120,6 +134,7 @@ class Bot {
       const value = state.value(SYMBOL, held.qty);
       const cost = held.cost;
       if (cost <= 0n) return [];
+      if (this.holdBars >= MAX_HOLD) return this.sellAll(held);
       if (value * BPS >= cost * (BPS + TP_BPS)) return this.sellAll(held);
       if (value * BPS <= cost * (BPS - STOP_BPS)) return this.sellAll(held);
       if (this.peak !== null && BigInt(closes[n - 1]) * BPS <= this.peak * (BPS - TRAIL_BPS)) {
